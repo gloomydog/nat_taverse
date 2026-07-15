@@ -134,9 +134,7 @@ endpoint-independent mapping and support UPnP or NAT-PMP, so a direct path
 usually opens.
 
 **`p2p_connect` is for the tail.** When both peers are behind
-carrier-grade NAT — two phones on mobile data, say — no amount of
-cleverness will produce a direct path, and something has to relay the
-bytes. 
+symmetric NAT (or EDM).
 
 ---
 
