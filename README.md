@@ -1,4 +1,4 @@
-# nat_traverse: 
+# nat_traverse: NAT hole punching and P2P connections
 
 Authenticated, encrypted, direct peer to peer UDP connections across NAT,
 written in C, with no server of your own required.
@@ -76,10 +76,7 @@ Then run this on both machines with that passphrase:
 It does not matter who starts first; whoever does waits up to 120 seconds
 for the other.
 
-Pass `0` as the port unless you have a specific reason not to. See
-[notes from testing](#notes-from-testing) for why a fixed well known port
-turned out to be a bad idea in practice.
-
+Pass `0` as the port unless you have a specific reason not to. 
 To use a different STUN server:
 
 ```sh
