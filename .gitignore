@@ -1,4 +1,4 @@
+# Build artifacts
 *.o
 p2p_nostr
-p2p_connect
-relay_server
+

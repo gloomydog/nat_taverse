@@ -3,6 +3,7 @@
 
 #include <stdint.h>
 #include <stddef.h>
+#include "crypto.h"
 
 /*
  * Minimal Nostr (NIP-01) client -- only what signalling needs:
@@ -26,28 +27,29 @@
 
 typedef struct {
     uint8_t seckey[NOSTR_SECKEY_LEN];
-    uint8_t pubkey[NOSTR_PUBKEY_LEN];
-    uint8_t enckey[32];   /* payload encryption; derived separately from the signing key */
+    uint8_t pubkey[NOSTR_PUBKEY_LEN];   /* x-only, BIP-340 */
+    uint8_t enckey[32];                 /* payload encryption */
 } nostr_identity_t;
 
-/* Derive the key material both peers share, from the shared secret.
+/* Turn derived key material into a Nostr identity.
  *
- * Design notes:
- *   - Both peers use the *same* signing key.  To a relay they look like
- *     one identity posting twice, which is exactly what makes the
- *     rendezvous work: each side subscribes with an `authors` filter on
- *     that pubkey and sees the other's events.
- *   - This proves knowledge of the secret, nothing more.  It is not peer
- *     authentication -- anyone with the secret can join.  Authenticate the
- *     peer cryptographically in your application handshake.
- *   - The encryption key is derived independently.  Addresses posted to a
- *     public relay must never be in clear text.
+ * Both peers derive the same signing key from the same passphrase. To a
+ * relay they look like one identity posting twice, which is exactly what
+ * makes the rendezvous work: each side subscribes with an `authors`
+ * filter on that pubkey and sees the other's events. The meeting point is
+ * the pubkey itself.
  *
- * Uses PBKDF2-HMAC-SHA256.  Argon2id would be a better choice if you
- * already link it.
+ * This proves knowledge of the passphrase and nothing more. It is not
+ * peer authentication; anyone holding the passphrase can join. The
+ * handshake in handshake.h is what actually authenticates.
+ *
+ * The encryption key is separate, so a signing key leak does not expose
+ * previously published addresses.
  *
  * Returns 0 on success. */
-int nostr_derive_identity(const char *shared_secret, nostr_identity_t *out);
+int nostr_identity_from_keys(const nt_keys_t *keys, nostr_identity_t *out);
+
+void nostr_identity_wipe(nostr_identity_t *id);
 
 /* Encrypt and base64-encode a payload (ChaCha20-Poly1305).
  * Mandatory: whatever goes in `content` is world-readable on the relay.

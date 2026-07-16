@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 
 #include "nostr.h"
+#include "crypto.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -10,7 +11,6 @@
 #include <openssl/evp.h>
 #include <openssl/sha.h>
 #include <openssl/rand.h>
-#include <openssl/kdf.h>
 
 #include <secp256k1.h>
 #include <secp256k1_schnorrsig.h>
@@ -55,14 +55,6 @@ static int b64_dec(const char *in, uint8_t *out, size_t maxlen) {
     return (int)real;
 }
 
-static int pbkdf2(const char *secret, const char *salt, uint8_t *out, size_t outlen) {
-    /* Iteration count is a compromise. Argon2id would be better if you
-     * already link a library that provides it. */
-    return PKCS5_PBKDF2_HMAC(secret, (int)strlen(secret),
-                             (const unsigned char *)salt, (int)strlen(salt),
-                             200000, EVP_sha256(), (int)outlen, out) == 1 ? 0 : -1;
-}
-
 /* one shared libsecp256k1 context */
 static secp256k1_context *get_ctx(void) {
     static secp256k1_context *ctx = NULL;
@@ -71,27 +63,24 @@ static secp256k1_context *get_ctx(void) {
     return ctx;
 }
 
-/* ------------------------- key derivation ------------------------- */
+/* ------------------------- identity ------------------------------- */
 
-int nostr_derive_identity(const char *shared_secret, nostr_identity_t *out) {
+int nostr_identity_from_keys(const nt_keys_t *keys, nostr_identity_t *out) {
     memset(out, 0, sizeof(*out));
-
-    /* separate salts keep the signing and encryption keys independent */
-    if (pbkdf2(shared_secret, "nat_traverse/nostr/sign/v1",
-               out->seckey, NOSTR_SECKEY_LEN) != 0) return -1;
-    if (pbkdf2(shared_secret, "nat_traverse/nostr/enc/v1",
-               out->enckey, sizeof(out->enckey)) != 0) return -1;
+    memcpy(out->seckey, keys->nostr_seed, NOSTR_SECKEY_LEN);
+    memcpy(out->enckey, keys->nostr_content_key, sizeof(out->enckey));
 
     secp256k1_context *ctx = get_ctx();
     if (!ctx) return -1;
 
-    /* The odds of landing outside the curve order are negligible, but
-     * check anyway and re-hash if it happens. */
+    /* The odds of the derived value falling outside the curve order are
+     * negligible, but check and re-hash rather than produce a broken key. */
     for (int attempt = 0; attempt < 8; attempt++) {
         if (secp256k1_ec_seckey_verify(ctx, out->seckey) == 1) break;
         uint8_t tmp[32];
         SHA256(out->seckey, 32, tmp);
         memcpy(out->seckey, tmp, 32);
+        nt_wipe(tmp, sizeof(tmp));
         if (attempt == 7) return -1;
     }
 
@@ -99,10 +88,17 @@ int nostr_derive_identity(const char *shared_secret, nostr_identity_t *out) {
     if (secp256k1_keypair_create(ctx, &kp, out->seckey) != 1) return -1;
 
     secp256k1_xonly_pubkey xpk;
-    if (secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp) != 1) return -1;
-    if (secp256k1_xonly_pubkey_serialize(ctx, out->pubkey, &xpk) != 1) return -1;
+    if (secp256k1_keypair_xonly_pub(ctx, &xpk, NULL, &kp) != 1) {
+        nt_wipe(&kp, sizeof(kp));
+        return -1;
+    }
+    int rc = secp256k1_xonly_pubkey_serialize(ctx, out->pubkey, &xpk);
+    nt_wipe(&kp, sizeof(kp));
+    return rc == 1 ? 0 : -1;
+}
 
-    return 0;
+void nostr_identity_wipe(nostr_identity_t *id) {
+    nt_wipe(id, sizeof(*id));
 }
 
 /* ---------------------- payload encryption ------------------------ */

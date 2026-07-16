@@ -1,252 +1,220 @@
-# nat_traverse: NAT hole punching and P2P rendezvous
+# nat_traverse: 
 
+Authenticated, encrypted, direct peer to peer UDP connections across NAT,
+written in C, with no server of your own required.
 
-Direct peer to peer UDP connections across NAT, written in C, with no
-server of your own required.
- 
-Rendezvous happens over public [Nostr](https://nostr.com) relays, so
-there's nothing to deploy. Both peers run the same command with the same
+Rendezvous happens over public [Nostr](https://nostr.com) relays, so there
+is nothing to deploy. Both peers run the same command with the same
 passphrase and a direct path opens between them.
- 
+
 ```console
-$ ./p2p_nostr 0 correct-horse-battery-staple
+$ ./p2p_nostr 0 syrup-jasmine-orchid-seagull-prairie-fathom-fiber-birch-...
+[keys] stretching the passphrase (Argon2id)
 [local] bound UDP 39689
 [portmap] asking the router (NAT-PMP / PCP / UPnP)
 [portmap] unavailable (unsupported or disabled)
-[stun] public address 203.0.113.44:39689 (via stun.l.google.com)
+[stun] IPv4 candidate 203.0.113.44:39689
+[stun] IPv6 candidate [2001:db8::1]:39689
 [nostr] subscribed on wss://relay.damus.io
 [nostr] subscribed on wss://nos.lol
 [nostr] waiting for peer (up to 120 s)
-[nostr] found peer at 198.51.100.7:53934
-[punch] trying to open a direct path
-[punch] connected to 198.51.100.7:53934
- 
---- connected (direct) ---
+[nostr] peer candidate 198.51.100.7:53934
+[punch] trying 1 candidate
+[punch] path open to 198.51.100.7:53934
+[handshake] authenticating
+[handshake] peer authenticated, session keys established
+
+--- connected, authenticated, encrypted ---
 ```
- 
-A conventional rendezvous server is also included, for the cases where a
-direct path just isn't possible and traffic needs to be relayed.
- 
-Dependencies: POSIX sockets and pthreads for everything, plus
-libsecp256k1 and OpenSSL for the Nostr client. Nothing else.
- 
- 
----
- 
+
+IPv4 and IPv6, whichever works. Mutual authentication and forward secrecy
+from a single shared passphrase.
+
 ## Build
- 
+
 ```sh
-make            # everything
-make nolibs     # skip p2p_nostr, no external libraries needed
+make
 ```
- 
-The Nostr client needs two libraries:
- 
+
+Three libraries:
+
 | library | why |
 |---|---|
+| libsodium | Argon2id, X25519, XChaCha20-Poly1305, constant-time comparison |
 | libsecp256k1 | BIP-340 Schnorr signatures for Nostr events |
-| OpenSSL | TLS for `wss://`, SHA-256, ChaCha20-Poly1305 |
- 
+| OpenSSL | TLS for `wss://`, SHA-256, Nostr payload cipher |
+
 ```sh
 # Arch
-sudo pacman -S openssl libsecp256k1
+sudo pacman -S libsodium libsecp256k1 openssl
 # Debian / Ubuntu
-sudo apt install libssl-dev libsecp256k1-dev
+sudo apt install libsodium-dev libsecp256k1-dev libssl-dev
 # macOS
-brew install openssl secp256k1
+brew install libsodium secp256k1 openssl
 ```
- 
+
 ## Usage
- 
-### Without a server
- 
-Run this on both machines, with the same passphrase:
- 
+
+Generate a passphrase and give it to the other side over something you
+already trust:
+
+```sh
+./p2p_nostr --gen-secret
+```
+
+Then run this on both machines with that passphrase:
+
 ```sh
 ./p2p_nostr 0 <shared_secret> [relay_url ...]
 ```
- 
+
 ```sh
-./p2p_nostr 0 correct-horse-battery-staple
-./p2p_nostr 0 my-secret wss://relay.damus.io wss://nos.lol
+./p2p_nostr 0 syrup-jasmine-orchid-seagull-prairie-fathom-fiber-birch-...
+./p2p_nostr 0 <secret> wss://relay.damus.io wss://nos.lol
 ```
- 
-It doesn't matter who starts first, whoever does waits up to 120 seconds
+
+It does not matter who starts first; whoever does waits up to 120 seconds
 for the other.
- 
-Pass `0` as the port unless you have a specific reason not to.
- 
+
+Pass `0` as the port unless you have a specific reason not to. See
+[notes from testing](#notes-from-testing) for why a fixed well known port
+turned out to be a bad idea in practice.
+
 To use a different STUN server:
- 
+
 ```sh
 NAT_TRAVERSE_STUN_HOST=stun.example.com NAT_TRAVERSE_STUN_PORT=3478 \
-    ./p2p_nostr 0 my-secret
+    ./p2p_nostr 0 <secret>
 ```
- 
-### With your own server
- 
-On a host with a public address:
- 
-```sh
-./relay_server 3478 -v
-sudo ufw allow 3478/udp     # if you run a firewall
+
+## How it works
+
 ```
- 
-On both peers:
- 
-```sh
-./p2p_connect 0 <server_host> 3478 <shared_secret>
+1. stretch the passphrase into key material            crypto.c
+2. ask the router for a port mapping                   portmap.c
+3. gather IPv4 and IPv6 candidates via STUN            stun.c
+4. publish them encrypted on Nostr, wait for the peer  signaling_nostr.c
+5. punch every candidate at once                       holepunch.c
+6. authenticate, then talk encrypted                   handshake.c, channel.c
 ```
- 
-## Which one should I use?
- 
-|  | `p2p_nostr` | `p2p_connect` |
-|---|---|---|
-| server of your own | not needed | required |
-| rendezvous | public Nostr relays | `relay_server` |
-| STUN | required | not needed |
-| when punching fails | connection fails | falls back to relaying |
-| external libraries | libsecp256k1, OpenSSL | none |
- 
-`p2p_nostr` is the one to reach for first. Most home routers use
-endpoint independent mapping and support UPnP or NAT-PMP, so a direct
-path usually opens without much trouble.
- 
-`p2p_connect` covers the cases `p2p_nostr` can't like the case when both peers sit
-symmetric NAT.
- 
----
- 
-## Design
- 
-```
-        p2p_nostr                       p2p_connect
-            |                                |
-    +----------------+              +-----------------+
-    | signaling_nostr|              |  relay_client   |
-    |   nostr + ws   |              |   relay_proto   |
-    +-------+--------+              +--------+--------+
-            |      (signaling.h interface)   |
-            +---------------+-----------------+
-                            |
-              +-------------+-------------+
-              |             |             |
-           portmap       holepunch      stun
-        NAT-PMP/PCP/    punch + ka    RFC 5389
-           UPnP
-```
- 
-`signaling.h` is the seam between the two approaches. Both backends
-implement it, so swapping the rendezvous transport doesn't touch the
-punching code at all. A BitTorrent DHT or an existing messaging channel
-would drop into the same interface without much fuss.
- 
-### How the Nostr backend works
- 
-1. Derive from the shared secret (PBKDF2-HMAC-SHA256): a secp256k1
-   signing key, the same one for both peers, plus a ChaCha20-Poly1305
-   key derived with an independent salt.
-2. Ask STUN for our public address.
-3. Publish it, encrypted, as an ephemeral event (kind 20117).
-4. Subscribe with `authors` set to our shared pubkey and decrypt the
-   peer's event when it arrives.
-5. Punch.
-Both peers signing with the same key is what makes the rendezvous work
-at all. To a relay they look like one identity posting twice, and each
-side finds the other with an `authors` filter. The meeting point really
-is the pubkey itself.
- 
-Kinds 20000 through 29999 are ephemeral: relays forward them but don't
-store them. Signalling data is worthless a few seconds later anyway, so
-this is the right range to use, and it leaves nothing behind on public
-infrastructure.
- 
-Addresses are always encrypted before publishing. Anything sitting in an
-event's `content` field is world readable otherwise.
- 
+
+Everything derives from one passphrase. Argon2id stretches it once, then
+independent subkeys fall out of that: the punch token, the Nostr signing
+key, the Nostr payload key, and the handshake pre-shared key. A leak of
+one tells you nothing about the others.
+
+**Rendezvous.** Both peers derive the *same* Nostr signing key, so to a
+relay they look like one identity posting twice. Each side subscribes with
+an `authors` filter on that pubkey and finds the other. The meeting point
+is the pubkey itself. Candidates are published as ephemeral events (kind
+20117), which relays forward but do not store, and always encrypted:
+anything in an event's `content` is otherwise world readable.
+
+**Punching.** Both peers transmit to each other at roughly the same time.
+Each outbound packet creates state in the sender's own NAT and stateful
+firewall, which then lets the reply through. The first packets are
+*supposed* to be dropped by the peer's filter; they still open the path,
+so a retransmission a moment later gets through. Retrying like this covers
+the strictest filtering behaviour, which is why the filtering type never
+needs to be detected.
+
+A host often has more than one way to be reached, so all candidates get
+punched at once and whichever answers first wins. IPv6 usually wins when
+available, since there is no NAT in the way, only a firewall to open.
+
+**Authentication.** Punching only produces a path. It says nothing about
+who is on the far end and protects nothing; the punch token is a filter
+against stray datagrams, not a secret, and it travels in clear. So the
+handshake is not optional. It is one symmetric round trip: ephemeral
+X25519 for forward secrecy, authenticated with a tag only a passphrase
+holder can produce, then a confirmation so a key mismatch fails
+immediately rather than confusingly later. After that, XChaCha20-Poly1305
+with a separate key per direction and a sliding replay window.
+
 | file | what it does |
 |---|---|
-| `p2p_nostr.c` | client: portmap, STUN, Nostr rendezvous, punch |
-| `p2p_connect.c` | client: portmap, server rendezvous, punch, relay |
-| `relay_server.c` | rendezvous and relay server |
-| `signaling.h` | backend interface |
-| `signaling_nostr.c` | Nostr backend |
-| `nostr.c` | NIP-01: events, ids, Schnorr signatures, payload encryption |
-| `ws.c` | WebSocket client (RFC 6455) with TLS |
-| `relay_client.c`, `relay_proto.c` | client and wire format for `relay_server` |
-| `holepunch.c` | simultaneous transmission, keepalive, token check |
+| `p2p_nostr.c` | the client, ties the steps together |
+| `crypto.c` | Argon2id key derivation, constant-time helpers |
+| `handshake.c` | authenticated key exchange, encrypted transport |
+| `channel.c` | handshake over UDP with retransmission, framing |
+| `holepunch.c` | simultaneous transmission, multi-candidate, keepalive |
 | `portmap.c` | NAT-PMP, PCP, UPnP IGD |
-| `stun.c` | STUN client (RFC 5389) |
- 
----
- 
-## Security
- 
-Read this before using the code for anything real.
- 
-The tokens and meeting ids here are lightweight filters, not
-authentication. `derive_token()` in the clients and `relay_derive_id()`
-are not KDFs, they're simple mixing functions, and should be replaced
-with Argon2id (or whatever your application already uses) before you
-depend on them for anything. The punch token itself travels in clear
-text; its only job is to stop an unrelated datagram from being mistaken
-for the peer. Both peers also share the Nostr signing key, which proves
-knowledge of the secret and nothing more. Anyone who has the secret can
-join the rendezvous.
- 
-So authenticate the peer cryptographically in your own handshake once
-the path is open. A successful punch is not identification.
- 
-What the code does handle properly: addresses published to Nostr are
-encrypted with ChaCha20-Poly1305 under a key derived independently of the
-signing key, and AEAD means any tampering gets caught. `wss://`
-connections verify certificates and hostnames. `relay_server` only
-forwards between registered peers, so it can't be turned into an open
-reflector. The relay itself never sees plaintext, it just forwards
-opaque bytes.
- 
-If you run `relay_server` publicly, add rate and bandwidth limits.
- 
----
-## Limitations
-**UDP only**. Where UDP is blocked outright, nothing here works, which is
-why DERP runs over HTTPS on TCP 443 instead. A TCP transport would be a
-reasonable thing to add.
- 
-**IPv4 only**. IPv6 mostly makes this whole problem go away, which is a nice
-thought but not something implemented here.
- 
-Both peers behind CGNAT won't get a direct path, full stop. Use
-`p2p_connect` with your own `relay_server` in that case.
- 
-UPnP discovery is slow. SSDP probing can take tens of seconds before
-giving up on a router that doesn't support it.
- 
-`p2p_nostr` has no data fallback, by design. Nostr relays aren't meant to
-be a byte pipe.
- 
-The chat loop in both clients exists to show the path actually carries
-traffic. It's a demonstration, not a protocol.
- 
+| `stun.c` | STUN client (RFC 5389), IPv4 and IPv6 |
+| `netaddr.c` | address handling, dual stack sockets, wire encoding |
+| `signaling.h` | rendezvous backend interface |
+| `signaling_nostr.c` | Nostr backend |
+| `nostr.c` | NIP-01: events, ids, Schnorr signatures |
+| `ws.c` | WebSocket client (RFC 6455) with TLS |
 
----
+## Security
+
+**Use `--gen-secret`. Do not invent a passphrase.**
+
+That is not boilerplate. An observer who captures a handshake can test
+guesses against it offline, at their leisure, without contacting anyone.
+Argon2id makes each guess cost real time and memory, but it does not
+change the shape of the attack: a memorable phrase will not survive it. A
+password-authenticated key exchange such as CPace closes this properly, at
+the cost of a much larger and much easier to misimplement protocol. The
+mitigation taken here is to make guessing pointless by generating 128 bits
+and treating the result like an SSH private key.
+
+Anyone holding the passphrase can join the rendezvous and complete the
+handshake. There is no notion of identity beyond it.
+
+What the code does handle:
+
+- Forward secrecy. Session keys come from ephemeral X25519 keys that are
+  discarded afterwards, so a passphrase leaking later does not decrypt
+  recorded traffic.
+- Mutual authentication before any application data moves.
+- Replay protection, both on the handshake and on every datagram after
+  it, via a sliding window.
+- Constant-time comparison of every secret, so a wrong guess does not leak
+  how nearly right it was.
+- Key material wiped from memory when done.
+- Addresses on Nostr encrypted under a key derived independently of the
+  signing key, with an AEAD so tampering is caught.
+- `wss://` connections verify certificates and hostnames.
+
+Argon2id runs at libsodium's INTERACTIVE setting, roughly 100 ms and
+64 MiB. Both peers must agree, so it is compiled in rather than
+negotiated; raise it in `crypto.c` if your threat model warrants it.
+
+
+## Limitations
+
+**Both peers behind symmetric NAT will not connect.** There is no
+direct path to find, and Nostr cannot forward data. Every serious
+implementation carries a relay for this case. 
+
+**UDP only.** Where UDP is blocked outright nothing here works, which is
+why DERP runs over HTTPS on TCP 443 instead.
+
+**Port mapping is IPv4 only.** NAT-PMP has no IPv6 form, and IPv6
+generally wants a firewall pinhole rather than a mapping, which punching
+already produces. Port mapping also only affects the first NAT hop, so
+behind CGNAT the router will install a mapping that does nothing. The
+client checks the external IP and says so when that happens.
+
+**UPnP discovery is slow.** SSDP probing can take tens of seconds before
+giving up on a router that does not support it.
+
+The chat loop exists to show the path carries traffic. It is a
+demonstration, not a protocol.
 
 ## References
 
-- RFC 4787 — [NAT Behavioral Requirements for Unicast UDP](https://www.rfc-editor.org/rfc/rfc4787)
-  (the mapping/filtering vocabulary)
-- RFC 5389 — [Session Traversal Utilities for NAT (STUN)](https://www.rfc-editor.org/rfc/rfc5389)
-- RFC 5780 — [NAT Behavior Discovery Using STUN](https://www.rfc-editor.org/rfc/rfc5780)
-  (not implemented here; would require `CHANGE-REQUEST` support)
-- RFC 6886 — [NAT Port Mapping Protocol (NAT-PMP)](https://www.rfc-editor.org/rfc/rfc6886)
-- RFC 6887 — [Port Control Protocol (PCP)](https://www.rfc-editor.org/rfc/rfc6887)
-- RFC 6455 — [The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455)
-- BIP-340 — [Schnorr Signatures for secp256k1](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki)
-- NIP-01 — [Nostr basic protocol flow](https://github.com/nostr-protocol/nips/blob/master/01.md)
-- Ford, Srisuresh, Kegel — [Peer-to-Peer Communication Across Network Address Translators](https://bford.info/pub/net/p2pnat/)
-  (the original treatment)
-- Tailscale — [How NAT traversal works](https://tailscale.com/blog/how-nat-traversal-works)
-  (the best practical write-up of the problem)
-
----
-
+- RFC 4787, [NAT Behavioral Requirements for Unicast UDP](https://www.rfc-editor.org/rfc/rfc4787),
+  the mapping and filtering vocabulary
+- RFC 5389, [Session Traversal Utilities for NAT (STUN)](https://www.rfc-editor.org/rfc/rfc5389)
+- RFC 6886, [NAT Port Mapping Protocol](https://www.rfc-editor.org/rfc/rfc6886)
+- RFC 6887, [Port Control Protocol](https://www.rfc-editor.org/rfc/rfc6887)
+- RFC 6455, [The WebSocket Protocol](https://www.rfc-editor.org/rfc/rfc6455)
+- RFC 9106, [Argon2](https://www.rfc-editor.org/rfc/rfc9106)
+- BIP-340, [Schnorr Signatures for secp256k1](https://github.com/bitcoin/bips/blob/master/bip-0340.mediawiki)
+- NIP-01, [Nostr basic protocol flow](https://github.com/nostr-protocol/nips/blob/master/01.md)
+- Ford, Srisuresh, Kegel, [Peer-to-Peer Communication Across Network Address Translators](https://bford.info/pub/net/p2pnat/),
+  the original treatment
+- Tailscale, [How NAT traversal works](https://tailscale.com/blog/how-nat-traversal-works),
+  probably the best practical writeup out there

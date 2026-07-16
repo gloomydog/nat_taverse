@@ -3,51 +3,50 @@
 
 #include <stdint.h>
 #include <stddef.h>
-#include <netinet/in.h>
+#include "netaddr.h"
 
 /*
  * Pluggable rendezvous transport.
  *
- * Before two peers can punch a hole they must exchange candidate
- * addresses somehow.  Any channel will do, and the choice is orthogonal
- * to the punching itself:
+ * Before two peers can punch a hole they have to exchange candidate
+ * addresses somehow. Any channel will do, and the choice is orthogonal to
+ * the punching itself, so it sits behind this interface.
  *
- *   nostr  -- public Nostr relays (signaling_nostr.c).  No server of your
- *             own.  Relays speak WebSocket over TCP, so they cannot see
- *             your UDP mapping; you must query STUN separately.
- *             Cannot carry data.
+ * Only one backend ships here, signaling_nostr.c, which rides public
+ * Nostr relays and needs no server of your own. A BitTorrent DHT, an
+ * existing messaging channel, or a rendezvous server you run yourself
+ * would all fit the same shape.
  *
- *   relay  -- your own rendezvous server (relay_server.c).  Needs a host
- *             with a public address, but the server observes your UDP
- *             source address directly (no STUN needed), can trigger both
- *             sides at the same instant, and can relay payloads when
- *             direct connectivity is impossible.
- *
- * A BitTorrent DHT or any existing messaging channel would fit the same
- * interface.
- *
- * Note that signalling and data relaying are separate problems: no choice
- * of signalling transport can make a direct path exist where the network
- * does not allow one.
+ * Note that signalling and data relaying are separate problems. Nothing
+ * chosen here can make a direct path exist where the network does not
+ * allow one; supports_relay() exists so a backend that can forward
+ * payloads may say so, and the Nostr one cannot.
  */
+
+#define SIG_MAX_CANDIDATES 8
+
+typedef struct {
+    netaddr_t addr[SIG_MAX_CANDIDATES];
+    int n;
+} sig_candidates_t;
 
 typedef struct signaling_backend signaling_backend_t;
 
 struct signaling_backend {
     void *ctx;
 
-    /* Announce our candidate address.  May be called repeatedly. */
-    int (*publish)(void *ctx, const struct sockaddr_in *my_addr);
+    /* Announce our candidates. May be called repeatedly. */
+    int (*publish)(void *ctx, const sig_candidates_t *mine);
 
-    /* Block until the peer's address is known.  Returns 0 on success.
+    /* Block until the peer's candidates are known. Returns 0 on success.
      *
-     * Punch immediately after this returns.  Every second of delay is a
-     * chance for the peer's NAT mapping to be reallocated, which is the
-     * single most common cause of failure. */
-    int (*wait_peer)(void *ctx, struct sockaddr_in *peer_out, int timeout_ms);
+     * Punch immediately after this returns. Every second of delay is
+     * another chance for the peer's NAT mapping to be reallocated, which
+     * is the most common cause of failure in practice. */
+    int (*wait_peer)(void *ctx, sig_candidates_t *peer_out, int timeout_ms);
 
-    /* Whether this backend can forward payloads when the direct path
-     * fails.  Nostr returns 0; the custom relay returns 1. */
+    /* Whether this backend can forward payloads when no direct path
+     * exists. The Nostr backend returns 0. */
     int (*supports_relay)(void *ctx);
 
     /* Only meaningful when supports_relay() returns 1. */

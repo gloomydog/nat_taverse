@@ -2,57 +2,50 @@
 #define STUN_H
 
 #include <stdint.h>
-#include <netinet/in.h>
+#include "netaddr.h"
 
 /*
- * Minimal STUN client (RFC 5389), Binding Request only.
+ * Minimal STUN client (RFC 5389), Binding Request only, IPv4 and IPv6.
  *
- * Purpose: ask a public server "what source address do you see me coming
- * from?".  The answer is the address our NAT allocated for the mapping
- * towards that particular server.
+ * Ask a public server what source address it saw us come from. That is
+ * the address our NAT allocated for the mapping toward that server.
  *
- * Important caveat: the reply describes the mapping towards *the STUN
- * server*, not towards an arbitrary peer.  On a NAT with
- * endpoint-dependent mapping (see README, "NAT behaviour"), the address a
- * peer sees will be different.  This is not a limitation of this code but
- * of STUN itself.
+ * The important caveat: the answer describes the mapping toward the STUN
+ * server, not toward an arbitrary peer. On a NAT with endpoint-dependent
+ * mapping the peer will see something else entirely. That is a property
+ * of STUN, not a shortcoming of this code. See BACKGROUND.md.
  *
  * No dependencies beyond POSIX sockets.
  */
 
-typedef struct {
-    struct sockaddr_in mapped_addr;  /* our address as seen from outside */
-    int ok;
-} stun_result_t;
+/* Query a STUN server.
+ *
+ * sockfd must already be bound, and must be the same socket used for the
+ * peer traffic afterwards: NAT mappings are per socket, so an address
+ * learned on a different socket is useless for punching.
+ *
+ * family selects which address family to reach the server over: pass
+ * AF_INET or AF_INET6, or AF_UNSPEC to take whatever resolves first. On a
+ * dual stack socket both work.
+ *
+ * Returns 0 on success, -1 on timeout or protocol error. */
+int stun_query(int sockfd, const char *host, uint16_t port, int family,
+               int timeout_ms, netaddr_t *out);
 
-/* Query a STUN server for our externally visible address.
+/* Compare the mappings two different servers report.
  *
- * sockfd must already be bound.  Use the *same* socket you intend to use
- * for the peer-to-peer traffic: NAT mappings are per-socket, so querying
- * from a different socket would return an address that is useless for
- * hole punching.
+ * Matching ports suggest endpoint-independent mapping; differing ports
+ * mean endpoint-dependent mapping, where punching is unlikely to work.
  *
- * Returns 0 on success, -1 on timeout or protocol error.
- */
-int stun_get_mapped_address(int sockfd, const char *stun_host, uint16_t stun_port,
-                            int timeout_ms, stun_result_t *out);
-
-/* Compare the mappings observed by two different STUN servers.
+ * Only probes the mapping axis, says nothing about filtering, and is
+ * weak evidence at best: two servers run by one operator may be reached
+ * over the same path and agree while a real peer sees something else.
+ * Observed in practice, see the notes in the README.
  *
- * If both servers report the same external port, the NAT is *probably*
- * doing endpoint-independent mapping (EIM).  If they differ, it is doing
- * endpoint-dependent mapping (EDM) and hole punching is unlikely to work.
- *
- * This only probes the mapping axis.  It says nothing about filtering
- * behaviour, and it can be fooled: two servers run by the same operator
- * may be reached over the same path and yield a consistent answer even
- * on an EDM NAT.  Treat a "0" result as weak evidence, not proof.
- *
- * Returns 0 for EIM-like, 1 for EDM-like, -1 if the probe failed.
- */
+ * Returns 0 for EIM-like, 1 for EDM, -1 if the probe failed. */
 int stun_detect_mapping_behaviour(int sockfd,
                                   const char *host1, uint16_t port1,
                                   const char *host2, uint16_t port2,
-                                  int timeout_ms);
+                                  int family, int timeout_ms);
 
 #endif
