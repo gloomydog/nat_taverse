@@ -1,104 +1,49 @@
 #include "handshake.h"
 
 #include <string.h>
-#include <arpa/inet.h>
 #include <sodium.h>
-
-#define LBL_COMMIT  "nt-hs-commit-v1"
-#define LBL_MASTER  "nt-hs-master-v1"
-#define LBL_CONFIRM "nt-hs-confirm-v1"
 
 #define CTX_TRAFFIC "nt-traff"
 
-/* tag = BLAKE2b(key=psk, LBL_COMMIT || e_pub || nonce) */
-static void commit_tag(const uint8_t psk[NT_PSK_LEN],
-                       const uint8_t e_pub[32], const uint8_t nonce[16],
-                       uint8_t out[16]) {
-    crypto_generichash_state h;
-    crypto_generichash_init(&h, psk, NT_PSK_LEN, 16);
-    crypto_generichash_update(&h, (const uint8_t *)LBL_COMMIT, sizeof(LBL_COMMIT) - 1);
-    crypto_generichash_update(&h, e_pub, 32);
-    crypto_generichash_update(&h, nonce, 16);
-    crypto_generichash_final(&h, out, 16);
-    sodium_memzero(&h, sizeof(h));
-}
-
-static void confirm_tag(const uint8_t master[32], int is_lo, uint8_t out[32]) {
-    uint8_t role = is_lo ? 0 : 1;
-    crypto_generichash_state h;
-    crypto_generichash_init(&h, master, 32, 32);
-    crypto_generichash_update(&h, (const uint8_t *)LBL_CONFIRM, sizeof(LBL_CONFIRM) - 1);
-    crypto_generichash_update(&h, &role, 1);
-    crypto_generichash_final(&h, out, 32);
-    sodium_memzero(&h, sizeof(h));
-}
+/* Domain-separates this handshake's CPace generator from any other use
+ * of psk elsewhere (psk is already context-separated at derivation time
+ * in crypto.c; this is defense in depth on top of that). */
+#define CPACE_CHANNEL_ID "nt-handshake-v1"
 
 int hs_start(hs_state_t *st, const uint8_t psk[NT_PSK_LEN],
              uint8_t out_msg1[HS_MSG1_LEN]) {
     memset(st, 0, sizeof(*st));
 
-    crypto_box_keypair(st->e_pub, st->e_priv);
-    randombytes_buf(st->nonce, sizeof(st->nonce));
+    if (cpace_init(&st->cpace, (const char *)psk, NT_PSK_LEN,
+                   CPACE_CHANNEL_ID, sizeof(CPACE_CHANNEL_ID) - 1, 0) != 0)
+        return -1;
 
-    memcpy(out_msg1, st->e_pub, 32);
-    memcpy(out_msg1 + 32, st->nonce, 16);
-    commit_tag(psk, st->e_pub, st->nonce, out_msg1 + 48);
+    memcpy(out_msg1, st->cpace.my_point, CPACE_POINTBYTES);
     return 0;
 }
 
-int hs_process_msg1(hs_state_t *st, const uint8_t psk[NT_PSK_LEN],
-                    const uint8_t msg1[HS_MSG1_LEN],
+int hs_process_msg1(hs_state_t *st, const uint8_t msg1[HS_MSG1_LEN],
                     uint8_t out_msg2[HS_MSG2_LEN]) {
-    const uint8_t *peer_pub = msg1;
-    const uint8_t *peer_nonce = msg1 + 32;
-    const uint8_t *peer_tag = msg1 + 48;
-
-    uint8_t expect[16];
-    commit_tag(psk, peer_pub, peer_nonce, expect);
-    if (sodium_memcmp(expect, peer_tag, 16) != 0) {
-        sodium_memzero(expect, sizeof(expect));
-        return -1;   /* not someone who holds the passphrase */
-    }
-    sodium_memzero(expect, sizeof(expect));
-
     /* Reject our own message echoed back, which would otherwise let an
      * attacker reflect it and have us derive a key with ourselves. */
-    if (sodium_memcmp(peer_pub, st->e_pub, 32) == 0) return -1;
+    if (sodium_memcmp(msg1, st->cpace.my_point, CPACE_POINTBYTES) == 0)
+        return -1;
 
-    uint8_t dh[32];
-    if (crypto_scalarmult(dh, st->e_priv, peer_pub) != 0) {
-        sodium_memzero(dh, sizeof(dh));
-        return -1;   /* rejects low-order points */
-    }
+    /* Both sides must land on the same A/B labelling, so order by
+     * comparing the two points rather than by who sent first. Note: a
+     * wrong passphrase is not detectable here - every point is valid
+     * regardless of password, by construction. That only surfaces at
+     * confirmation (hs_process_msg2). */
+    st->is_lo = sodium_compare(st->cpace.my_point, msg1, CPACE_POINTBYTES) < 0;
+    st->cpace.is_initiator = st->is_lo;
 
-    /* Both sides must hash the same transcript, so order the two
-     * contributions by public key rather than by who sent first. */
-    st->is_lo = sodium_compare(st->e_pub, peer_pub, 32) < 0;
+    if (cpace_derive_session_key(&st->cpace, msg1) != 0)
+        return -1;   /* rejects the identity element / invalid points */
 
-    const uint8_t *lo_pub   = st->is_lo ? st->e_pub   : peer_pub;
-    const uint8_t *lo_nonce = st->is_lo ? st->nonce   : peer_nonce;
-    const uint8_t *hi_pub   = st->is_lo ? peer_pub    : st->e_pub;
-    const uint8_t *hi_nonce = st->is_lo ? peer_nonce  : st->nonce;
-
-    crypto_generichash_state h;
-    crypto_generichash_init(&h, psk, NT_PSK_LEN, 32);
-    crypto_generichash_update(&h, (const uint8_t *)LBL_MASTER, sizeof(LBL_MASTER) - 1);
-    crypto_generichash_update(&h, dh, 32);
-    crypto_generichash_update(&h, lo_pub, 32);
-    crypto_generichash_update(&h, lo_nonce, 16);
-    crypto_generichash_update(&h, hi_pub, 32);
-    crypto_generichash_update(&h, hi_nonce, 16);
-    crypto_generichash_final(&h, st->master, 32);
-
-    sodium_memzero(&h, sizeof(h));
-    sodium_memzero(dh, sizeof(dh));
-
-    /* The private key has done its job; drop it now so it cannot leak
-     * from memory later in the session. */
-    sodium_memzero(st->e_priv, sizeof(st->e_priv));
-
+    memcpy(st->master, st->cpace.session_key, sizeof(st->master));
     st->have_master = 1;
-    confirm_tag(st->master, st->is_lo, out_msg2);
+
+    cpace_compute_confirmation(&st->cpace, st->is_lo ? "A" : "B", out_msg2);
     return 0;
 }
 
@@ -107,11 +52,11 @@ int hs_process_msg2(hs_state_t *st, const uint8_t msg2[HS_MSG2_LEN],
     if (!st->have_master) return -1;
 
     /* The peer confirms with the opposite role to ours. */
-    uint8_t expect[32];
-    confirm_tag(st->master, !st->is_lo, expect);
-    int ok = sodium_memcmp(expect, msg2, 32) == 0;
+    uint8_t expect[CPACE_MACBYTES];
+    cpace_compute_confirmation(&st->cpace, st->is_lo ? "B" : "A", expect);
+    int ok = sodium_memcmp(expect, msg2, CPACE_MACBYTES) == 0;
     sodium_memzero(expect, sizeof(expect));
-    if (!ok) return -1;
+    if (!ok) return -1;   /* wrong passphrase, or an active attacker */
 
     memset(out, 0, sizeof(*out));
 

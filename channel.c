@@ -1,4 +1,5 @@
 #include "channel.h"
+#include "padding.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -21,7 +22,9 @@ static void set_rcv_timeout(int fd, int ms) {
 
 static int send_typed(int fd, const netaddr_t *peer, uint8_t type,
                       const void *body, size_t len) {
-    uint8_t buf[1 + CH_MAX_PLAINTEXT + HS_OVERHEAD];
+    /* Sized on HS_MAX_PLAINTEXT, the true bound on what hs_seal() can
+     * produce, not CH_MAX_PLAINTEXT (the smaller pre-padding limit). */
+    uint8_t buf[1 + HS_MAX_PLAINTEXT + HS_OVERHEAD];
     if (1 + len > sizeof(buf)) return -1;
     buf[0] = type;
     memcpy(buf + 1, body, len);
@@ -84,7 +87,7 @@ int channel_handshake(int sockfd, const netaddr_t *peer,
 
         if (buf[0] == CH_TYPE_HS1 && n == 1 + HS_MSG1_LEN) {
             if (have_my_msg2) continue;   /* already processed one */
-            if (hs_process_msg1(&st, psk, buf + 1, my_msg2) != 0) {
+            if (hs_process_msg1(&st, buf + 1, my_msg2) != 0) {
                 /* Wrong passphrase, or a forgery. Ignore and keep waiting
                  * rather than aborting: the real peer may still arrive. */
                 continue;
@@ -119,8 +122,17 @@ int channel_handshake(int sockfd, const netaddr_t *peer,
 
 int channel_send(int sockfd, const netaddr_t *peer, hs_session_t *s,
                  const void *data, size_t len) {
-    uint8_t ct[CH_MAX_PLAINTEXT + HS_OVERHEAD];
-    int clen = hs_seal(s, data, len, ct, sizeof(ct));
+    if (len > CH_MAX_PLAINTEXT) return -1;
+
+    uint8_t padded[HS_MAX_PLAINTEXT];
+    size_t padded_len = 0;
+    if (pad_message((const uint8_t *)data, len, padded, sizeof(padded),
+                    &padded_len) != 0)
+        return -1;
+
+    uint8_t ct[HS_MAX_PLAINTEXT + HS_OVERHEAD];
+    int clen = hs_seal(s, padded, padded_len, ct, sizeof(ct));
+    nt_wipe(padded, sizeof(padded));
     if (clen < 0) return -1;
     int rc = send_typed(sockfd, peer, CH_TYPE_DATA, ct, (size_t)clen);
     nt_wipe(ct, sizeof(ct));
@@ -131,7 +143,7 @@ int channel_recv(int sockfd, hs_session_t *s, void *out, size_t outcap,
                  int timeout_ms) {
     set_rcv_timeout(sockfd, timeout_ms);
 
-    uint8_t buf[1 + CH_MAX_PLAINTEXT + HS_OVERHEAD];
+    uint8_t buf[1 + HS_MAX_PLAINTEXT + HS_OVERHEAD];
     ssize_t n = recvfrom(sockfd, buf, sizeof(buf), 0, NULL, NULL);
     if (n < 0) {
         if (errno == EAGAIN || errno == EWOULDBLOCK) return 0;
@@ -140,7 +152,17 @@ int channel_recv(int sockfd, hs_session_t *s, void *out, size_t outcap,
     if (n < 1) return 0;
     if (buf[0] != CH_TYPE_DATA) return 0;   /* keepalive or stray */
 
-    int plen = hs_open(s, buf + 1, (size_t)n - 1, out, outcap);
+    uint8_t padded[HS_MAX_PLAINTEXT];
+    int plen = hs_open(s, buf + 1, (size_t)n - 1, padded, sizeof(padded));
     if (plen < 0) return 0;   /* forged, corrupted, or replayed: drop quietly */
-    return plen;
+
+    size_t msg_len = 0;
+    if (unpad_message(padded, (size_t)plen, &msg_len) != 0 ||
+        msg_len > outcap) {
+        nt_wipe(padded, sizeof(padded));
+        return 0;   /* bad padding: same as tampering, drop quietly */
+    }
+    memcpy(out, padded, msg_len);
+    nt_wipe(padded, sizeof(padded));
+    return (int)msg_len;
 }

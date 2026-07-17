@@ -1,4 +1,4 @@
-# nat_traverse: NAT hole punching and P2P connections
+# nat_traverse: UDP hole punching for P2P connections
 
 Authenticated, encrypted, direct peer to peer UDP connections across NAT,
 written in C, with no server of your own required.
@@ -40,7 +40,7 @@ Three libraries:
 
 | library | why |
 |---|---|
-| libsodium | Argon2id, X25519, XChaCha20-Poly1305, constant-time comparison |
+| libsodium | Argon2id, ristretto255 (CPace), XChaCha20-Poly1305, constant-time comparison |
 | libsecp256k1 | BIP-340 Schnorr signatures for Nostr events |
 | OpenSSL | TLS for `wss://`, SHA-256, Nostr payload cipher |
 
@@ -100,6 +100,12 @@ independent subkeys fall out of that: the punch token, the Nostr signing
 key, the Nostr payload key, and the handshake pre-shared key. A leak of
 one tells you nothing about the others.
 
+**Authentication is CPace** (RFC 9382, ristretto255): the handshake
+pre-shared key is not just mixed into a MAC, it is used to derive the
+Diffie-Hellman *generator* itself, so an observer who records the whole
+exchange cannot test a passphrase guess offline against it. See
+[Security](#security).
+
 **Rendezvous.** Both peers derive the *same* Nostr signing key, so to a
 relay they look like one identity posting twice. Each side subscribes with
 an `authors` filter on that pubkey and finds the other. The meeting point
@@ -122,9 +128,10 @@ available, since there is no NAT in the way, only a firewall to open.
 **Authentication.** Punching only produces a path. It says nothing about
 who is on the far end and protects nothing; the punch token is a filter
 against stray datagrams, not a secret, and it travels in clear. So the
-handshake is not optional. It is one symmetric round trip: ephemeral
-X25519 for forward secrecy, authenticated with a tag only a passphrase
-holder can produce, then a confirmation so a key mismatch fails
+handshake is not optional. It is one symmetric round trip of CPace
+(RFC 9382, ristretto255): both sides derive a password-dependent DH
+generator from the pre-shared key, exchange ephemeral points over it for
+forward secrecy, then confirm with a MAC so a passphrase mismatch fails
 immediately rather than confusingly later. After that, XChaCha20-Poly1305
 with a separate key per direction and a sliding replay window.
 
@@ -132,7 +139,9 @@ with a separate key per direction and a sliding replay window.
 |---|---|
 | `p2p_nostr.c` | the client, ties the steps together |
 | `crypto.c` | Argon2id key derivation, constant-time helpers |
+| `cpace.c` | CPace (RFC 9382) password-authenticated key agreement |
 | `handshake.c` | authenticated key exchange, encrypted transport |
+| `padding.c` | length-hiding padding for application data |
 | `channel.c` | handshake over UDP with retransmission, framing |
 | `holepunch.c` | simultaneous transmission, multi-candidate, keepalive |
 | `portmap.c` | NAT-PMP, PCP, UPnP IGD |
@@ -147,28 +156,45 @@ with a separate key per direction and a sliding replay window.
 
 **Use `--gen-secret`. Do not invent a passphrase.**
 
-That is not boilerplate. An observer who captures a handshake can test
-guesses against it offline, at their leisure, without contacting anyone.
-Argon2id makes each guess cost real time and memory, but it does not
-change the shape of the attack: a memorable phrase will not survive it. A
-password-authenticated key exchange such as CPace closes this properly, at
-the cost of a much larger and much easier to misimplement protocol. The
-mitigation taken here is to make guessing pointless by generating 128 bits
-and treating the result like an SSH private key.
+That is still the recommendation, but the reason changed. The handshake
+itself (`handshake.c`, `cpace.c`) now runs CPace (RFC 9382): the
+passphrase-derived pre-shared key chooses the Diffie-Hellman *generator*,
+not just a MAC key, so an observer who records the entire handshake gains
+no ability to test a passphrase guess offline against it — each guess
+costs one live impersonation attempt against a peer, not a hash
+computation on captured traffic. That closes the classic offline
+dictionary attack against the handshake transcript.
+
+It does not, by itself, make the rest of the system safe for a memorable
+phrase. The Nostr rendezvous pubkey and the punch token (`crypto.c`) are
+still derived deterministically from the same Argon2id-stretched
+passphrase, and both are visible to anyone who can see the relay traffic
+or the punch packets. Testing a guess against *those* is still possible —
+Argon2id makes each attempt cost real time and memory, but does not
+change the shape of the attack, and a memorable phrase will not survive
+a determined offline search. The mitigation is the same as before: make
+guessing pointless by generating 128 bits with `nt_generate_secret()` and
+treating the result like an SSH private key.
 
 Anyone holding the passphrase can join the rendezvous and complete the
 handshake. There is no notion of identity beyond it.
 
 What the code does handle:
 
-- Forward secrecy. Session keys come from ephemeral X25519 keys that are
-  discarded afterwards, so a passphrase leaking later does not decrypt
-  recorded traffic.
-- Mutual authentication before any application data moves.
+- Forward secrecy. Session keys come from ephemeral CPace scalars that
+  are discarded afterwards, so a passphrase leaking later does not
+  decrypt recorded traffic.
+- Mutual authentication before any application data moves, via a
+  password-authenticated key exchange rather than a plain PSK-tagged DH —
+  no offline dictionary attack against a captured handshake transcript.
 - Replay protection, both on the handshake and on every datagram after
   it, via a sliding window.
 - Constant-time comparison of every secret, so a wrong guess does not leak
   how nearly right it was.
+- Length-hiding padding on every message (`padding.c`): plaintexts are
+  padded to a 128-byte boundary before sealing, so ciphertext size on the
+  wire only reveals which bucket a message fell into, not its exact
+  length.
 - Key material wiped from memory when done.
 - Addresses on Nostr encrypted under a key derived independently of the
   signing key, with an AEAD so tampering is caught.

@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stddef.h>
 #include "crypto.h"
+#include "cpace.h"
 
 /*
  * Mutual authentication and an encrypted channel, run over a UDP path
@@ -17,52 +18,58 @@
  * can read and rewrite what you send.
  *
  *
- * Protocol
- * --------
+ * Protocol: CPace (RFC 9382, ristretto255)
+ * -----------------------------------------
  *
  * Symmetric, one round trip, both sides send the same message shape at
  * the same time. This fits the punching model, where there is no natural
- * client or server.
+ * client or server. Unlike a plain PSK-authenticated DH, this is a real
+ * password-authenticated key exchange: the DH generator itself is derived
+ * from the passphrase, so an observer who records the whole exchange gains
+ * no ability to test a passphrase guess offline. Each guess costs one live
+ * impersonation attempt against a peer, not a hash computation on captured
+ * traffic.
  *
  *   psk = subkey of Argon2id(passphrase)
  *
- *   both:  e_priv, e_pub <- fresh X25519 keypair, per session
- *          n <- 16 random bytes
- *          tag = BLAKE2b(key=psk, "nt-hs-commit-v1" || e_pub || n)
- *          send  e_pub || n || tag
+ *   both:  g <- hash_to_group(psk, "nt-handshake-v1")   (cpace_init)
+ *          y <- random scalar; Y = y*g
+ *          send Y
  *
  *   on receipt:
- *          verify tag                          (peer knows the psk)
- *          dh = X25519(e_priv, peer_e_pub)
- *          order the two (e_pub, n) pairs by e_pub bytes so both sides
- *          build an identical transcript regardless of who is who
- *          master = BLAKE2b(key=psk, dh || transcript)
- *          k_lo->hi, k_hi->lo = subkeys of master
+ *          reject if peer's Y equals our own (reflection defense)
+ *          reject if peer's Y is not a valid group element
+ *          order the pair by comparing the two Y values as bytes, so both
+ *          sides agree on an A/B labelling regardless of who sent first
+ *          K = y * Y_peer  (= y_a*y_b*g on both sides)
+ *          session_key = H(K || g || Y_A || Y_B)
  *
- *   both:  send BLAKE2b(key=master, "nt-hs-confirm-v1" || own_role)
- *          verify the peer's, which proves both derived the same master
+ *   both:  send H(key=session_key, "confirm" || own_role)
+ *          verify the peer's, which proves both derived the same key from
+ *          the same passphrase
  *
- * The ephemeral keys give forward secrecy: they are discarded when the
+ * A wrong passphrase is not detectable from the first message alone -
+ * every point is valid regardless of password, by construction. It only
+ * surfaces at confirmation, when the MAC fails. This is expected: it is
+ * what makes offline testing impossible in the first place.
+ *
+ * The ephemeral scalars give forward secrecy: they are discarded when the
  * session ends, so a passphrase leaking later does not decrypt recorded
- * traffic. The tag gives mutual authentication, since only a psk holder
- * can produce one. Confirmation catches a key mismatch immediately
- * instead of leaving it to fail confusingly later.
+ * traffic.
  *
  *
  * What this does not protect against
  * ----------------------------------
  *
- * An observer who captures a handshake can test passphrase guesses
- * against the tag offline, at their leisure, without contacting anyone.
- * Argon2id makes each guess expensive but does not change the shape of
- * the attack. A password-authenticated key exchange such as CPace closes
- * this properly, at the cost of a much larger and easier to misimplement
- * protocol.
- *
- * The mitigation here is to make guessing pointless: generate the
- * passphrase with nt_generate_secret() and transfer it the way you would
- * an SSH key. A guessable passphrase is not safe here regardless of how
- * much stretching sits behind it.
+ * CPace removes the offline dictionary attack against *this* exchange.
+ * It does not, by itself, make the rest of the system safe for a
+ * memorable passphrase: the Nostr rendezvous pubkey and the punch token
+ * (crypto.c) are still derived deterministically from the same
+ * Argon2id-stretched passphrase and are visible to anyone who can see the
+ * relay traffic or the punch packets. Testing a passphrase guess against
+ * those is still possible, just Argon2id-costed rather than impossible.
+ * `nt_generate_secret()` remains the recommended way to obtain a
+ * passphrase; see the README security notes.
  *
  *
  * Transport
@@ -79,9 +86,9 @@
  * WireGuard use.
  */
 
-#define HS_MSG1_LEN   (32 + 16 + 16)   /* e_pub || nonce || tag */
-#define HS_MSG2_LEN   32               /* confirmation */
-#define HS_OVERHEAD   (8 + 16)         /* counter + Poly1305 tag */
+#define HS_MSG1_LEN   CPACE_POINTBYTES   /* Y */
+#define HS_MSG2_LEN   CPACE_MACBYTES     /* confirmation */
+#define HS_OVERHEAD   (8 + 16)           /* counter + Poly1305 tag */
 #define HS_MAX_PLAINTEXT 1024
 
 typedef struct {
@@ -99,30 +106,27 @@ typedef struct {
     int established;
 } hs_session_t;
 
-/* Build our handshake message. Call once per session.
- *
- * st carries the ephemeral private key between the two steps and must
- * live until hs_process_msg1() returns. */
 typedef struct {
-    uint8_t e_priv[32];
-    uint8_t e_pub[32];
-    uint8_t nonce[16];
-    uint8_t master[32];
-    int is_lo;          /* role, decided by comparing public keys */
+    cpace_ctx cpace;
+    uint8_t master[32];   /* copy of cpace.session_key once derived */
+    int is_lo;             /* role, decided by comparing the two Y values */
     int have_master;
 } hs_state_t;
 
+/* Build our handshake message (our CPace public point). Call once per
+ * session. */
 int hs_start(hs_state_t *st, const uint8_t psk[NT_PSK_LEN],
              uint8_t out_msg1[HS_MSG1_LEN]);
 
-/* Verify the peer's message and derive the session keys.
- * Returns 0 on success, -1 if the tag does not verify, which means the
- * sender does not hold the passphrase. */
-int hs_process_msg1(hs_state_t *st, const uint8_t psk[NT_PSK_LEN],
-                    const uint8_t msg1[HS_MSG1_LEN],
+/* Process the peer's point and derive the session key. A wrong
+ * passphrase is not detectable here by design - see the protocol note
+ * above - only a malformed or reflected point is rejected here.
+ * Returns 0 on success, -1 if the point is invalid or reflected. */
+int hs_process_msg1(hs_state_t *st, const uint8_t msg1[HS_MSG1_LEN],
                     uint8_t out_msg2[HS_MSG2_LEN]);
 
-/* Check the peer's confirmation and finalise the session.
+/* Check the peer's confirmation and finalise the session. This is where
+ * a passphrase mismatch actually surfaces.
  * Returns 0 on success, -1 on mismatch. */
 int hs_process_msg2(hs_state_t *st, const uint8_t msg2[HS_MSG2_LEN],
                     hs_session_t *out);

@@ -30,13 +30,28 @@
  * The handshake is two round trips over UDP, so any message can be lost.
  * Both sides resend until they see what they need, which also handles the
  * two peers reaching this point a little apart.
+ *
+ * Padding
+ * -------
+ * AEAD hides content, not length: "hi" and "meet at the corner at 8"
+ * produce visibly different ciphertext sizes on the wire even though both
+ * are encrypted. channel_send() pads every plaintext up to a multiple of
+ * PAD_BLOCKSIZE (ISO/IEC 7816-4, via libsodium's constant-time
+ * sodium_pad) before sealing, so an observer only learns which bucket a
+ * message fell into, not its exact length. channel_recv() reverses this
+ * after decrypting.
  */
 
 #define CH_TYPE_HS1  0x10
 #define CH_TYPE_HS2  0x11
 #define CH_TYPE_DATA 0x12
 
-#define CH_MAX_PLAINTEXT HS_MAX_PLAINTEXT
+/* The largest plaintext channel_send() accepts. Padding always adds at
+ * least one byte (the 0x80 marker), so the padded length can reach
+ * HS_MAX_PLAINTEXT only if the unpadded length is strictly less; this is
+ * the tightest bound that still guarantees the padded message fits what
+ * hs_seal() will accept. */
+#define CH_MAX_PLAINTEXT (HS_MAX_PLAINTEXT - 1)
 
 /* Authenticate the peer and establish session keys.
  *
