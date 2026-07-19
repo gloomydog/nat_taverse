@@ -1,5 +1,11 @@
 # nat_traverse: UDP hole punching for P2P connections
 
+-------------
+**WIP: fixing BUGS**
+
+----------------
+
+
 Authenticated, encrypted, direct peer to peer UDP connections across NAT,
 written in C, with no server of your own required.
 
