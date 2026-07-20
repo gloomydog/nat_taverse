@@ -4,11 +4,14 @@
 - Written in C.
 - with no server of your own required. 
 
+
+
 This library does **NAT traversal only**. It opens the path and stops
 there. It does not encrypt your traffic, authenticate your peer beyond the
 punch itself, or provide reliability or ordering — run your own protocol
-(or DTLS, Noise, WireGuard) over the socket it returns. See
-[Scope](#scope).
+(or DTLS, Noise, WireGuard) over the socket it returns.
+
+![screenshot](images/screenshot.png)
 
 ```c
 nt_config_t cfg;
