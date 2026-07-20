@@ -181,36 +181,6 @@ void netaddr_to_v4mapped(netaddr_t *a) {
     a->len = sizeof(*s);
 }
 
-int netaddr_is_global(const netaddr_t *a) {
-    int fam;
-    uint8_t r[16];
-    uint16_t port;
-    canonical(a, &fam, r, &port);
-
-    if (fam == AF_INET) {
-        if (r[0] == 10) return 0;                              /* 10/8 */
-        if (r[0] == 127) return 0;                             /* loopback */
-        if (r[0] == 0) return 0;
-        if (r[0] == 172 && r[1] >= 16 && r[1] <= 31) return 0; /* 172.16/12 */
-        if (r[0] == 192 && r[1] == 168) return 0;              /* 192.168/16 */
-        if (r[0] == 169 && r[1] == 254) return 0;              /* link-local */
-        if (r[0] == 100 && r[1] >= 64 && r[1] <= 127) return 0;/* CGNAT */
-        return 1;
-    }
-
-    /* IPv6 */
-    static const uint8_t loopback[16] = { [15] = 1 };
-    if (memcmp(r, loopback, 16) == 0) return 0;
-    {
-        int all_zero = 1;
-        for (int i = 0; i < 16; i++) if (r[i]) { all_zero = 0; break; }
-        if (all_zero) return 0;
-    }
-    if ((r[0] & 0xFE) == 0xFC) return 0;                       /* fc00::/7 ULA */
-    if (r[0] == 0xFE && (r[1] & 0xC0) == 0x80) return 0;       /* fe80::/10 */
-    return 1;
-}
-
 int netaddr_open_dualstack_udp(uint16_t *port) {
     int fd = socket(AF_INET6, SOCK_DGRAM, 0);
     if (fd >= 0) {

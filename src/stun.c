@@ -208,12 +208,158 @@ int stun_query(int sockfd, const char *host, uint16_t port, int family,
     return -1;
 }
 
-int stun_detect_mapping_behaviour(int sockfd,
-                                  const char *host1, uint16_t port1,
-                                  const char *host2, uint16_t port2,
-                                  int family, int timeout_ms) {
-    netaddr_t a, b;
-    if (stun_query(sockfd, host1, port1, family, timeout_ms, &a) != 0) return -1;
-    if (stun_query(sockfd, host2, port2, family, timeout_ms, &b) != 0) return -1;
-    return netaddr_equal(&a, &b) ? 0 : 1;
+/* ------------------------------ server list ----------------------------- */
+
+typedef struct {
+    char     host[128];
+    uint16_t port;
+} stun_server_t;
+
+/* Spread across operators on purpose: see the note in stun.h. */
+static const stun_server_t DEFAULT_SERVERS[] = {
+    { "stun.l.google.com",     19302 },
+    { "stun.cloudflare.com",    3478 },
+    { "stun.nextcloud.com",      443 },
+    { "stun.sipgate.net",       3478 },
+};
+#define N_DEFAULT (int)(sizeof(DEFAULT_SERVERS) / sizeof(DEFAULT_SERVERS[0]))
+
+static stun_server_t g_servers[STUN_MAX_SERVERS];
+static int g_nservers = 0;
+
+/* Parse one `host`, `host:port`, `[v6]` or `[v6]:port` entry. */
+static int parse_server(const char *tok, stun_server_t *out) {
+    size_t len = strlen(tok);
+    if (len == 0 || len >= sizeof(out->host)) return -1;
+
+    out->port = 3478;
+
+    if (tok[0] == '[') {
+        const char *close = strchr(tok, ']');
+        if (!close) return -1;
+        size_t hlen = (size_t)(close - tok - 1);
+        if (hlen == 0 || hlen >= sizeof(out->host)) return -1;
+        memcpy(out->host, tok + 1, hlen);
+        out->host[hlen] = '\0';
+        if (close[1] == ':') {
+            int p = atoi(close + 2);
+            if (p <= 0 || p > 65535) return -1;
+            out->port = (uint16_t)p;
+        } else if (close[1] != '\0') {
+            return -1;
+        }
+        return 0;
+    }
+
+    /* A bare IPv6 literal has several colons; only treat the last colon as
+     * a port separator when there is exactly one, which is the host:port
+     * case. Unbracketed v6 with a port is ambiguous and rejected above. */
+    const char *colon = strchr(tok, ':');
+    if (colon && strchr(colon + 1, ':') == NULL) {
+        size_t hlen = (size_t)(colon - tok);
+        if (hlen == 0 || hlen >= sizeof(out->host)) return -1;
+        int p = atoi(colon + 1);
+        if (p <= 0 || p > 65535) return -1;
+        memcpy(out->host, tok, hlen);
+        out->host[hlen] = '\0';
+        out->port = (uint16_t)p;
+        return 0;
+    }
+
+    /* Anything left holding a colon can only be an unbracketed IPv6
+     * literal, which is fine without a port but must actually be one --
+     * otherwise junk like ":::" sails through as a "hostname" and we
+     * spend a DNS timeout per lookup discovering it is not. */
+    if (strchr(tok, ':')) {
+        struct in6_addr probe;
+        if (inet_pton(AF_INET6, tok, &probe) != 1) return -1;
+    }
+
+    memcpy(out->host, tok, len + 1);
+    return 0;
+}
+
+/* Parsed once, then read-only. See the threading note in stun.h. */
+static void servers_init(void) {
+    if (g_nservers) return;
+
+    const char *env = getenv("NAT_TRAVERSE_STUN_SERVERS");
+    if (env && *env) {
+        char buf[1024];
+        snprintf(buf, sizeof(buf), "%s", env);
+        for (char *tok = strtok(buf, ", \t");
+             tok && g_nservers < STUN_MAX_SERVERS;
+             tok = strtok(NULL, ", \t")) {
+            if (parse_server(tok, &g_servers[g_nservers]) == 0) g_nservers++;
+        }
+    }
+
+    /* An unset, empty, or wholly unparseable override leaves the defaults
+     * in place rather than leaving us with no servers at all. */
+    if (g_nservers == 0) {
+        for (int i = 0; i < N_DEFAULT && i < STUN_MAX_SERVERS; i++)
+            g_servers[g_nservers++] = DEFAULT_SERVERS[i];
+    }
+}
+
+/* ------------------------------- srflx ---------------------------------- */
+
+static int socket_is_v6(int sockfd) {
+    struct sockaddr_storage ss;
+    socklen_t sl = sizeof(ss);
+    if (getsockname(sockfd, (struct sockaddr *)&ss, &sl) != 0) return 0;
+    return ss.ss_family == AF_INET6;
+}
+
+static int srflx_over(int sockfd, int family, int timeout_ms, netaddr_t *out) {
+    servers_init();
+    for (int i = 0; i < g_nservers; i++) {
+        if (stun_query(sockfd, g_servers[i].host, g_servers[i].port,
+                       family, timeout_ms, out) == 0)
+            return 0;
+    }
+    return -1;
+}
+
+int stun_srflx(int sockfd, int timeout_ms, netaddr_t *out) {
+    return srflx_over(sockfd, AF_INET, timeout_ms, out);
+}
+
+int stun_srflx6(int sockfd, int timeout_ms, netaddr_t *out) {
+    /* An IPv4-only socket cannot reach a v6 server at all; fail up front
+     * rather than burning one timeout per configured server. */
+    if (!socket_is_v6(sockfd)) return -1;
+    return srflx_over(sockfd, AF_INET6, timeout_ms, out);
+}
+
+/* ---------------------------- mapping behaviour ------------------------- */
+
+const char *nat_type_str(nat_type_t t) {
+    switch (t) {
+    case NAT_CONE:      return "cone (endpoint-independent, punchable)";
+    case NAT_SYMMETRIC: return "symmetric (endpoint-dependent, punch may fail)";
+    default:            return "unknown";
+    }
+}
+
+nat_type_t stun_nat_type(int sockfd, int timeout_ms, netaddr_t *mapped) {
+    servers_init();
+
+    netaddr_t seen[2];
+    int got = 0;
+
+    /* First two servers that answer. One being down costs us the verdict,
+     * not the candidate. */
+    for (int i = 0; i < g_nservers && got < 2; i++) {
+        if (stun_query(sockfd, g_servers[i].host, g_servers[i].port,
+                       AF_INET, timeout_ms, &seen[got]) == 0)
+            got++;
+    }
+
+    /* Hand back a candidate from whatever answered, even when that was
+     * only one server and the verdict has to be NAT_UNKNOWN. */
+    if (mapped && got > 0) *mapped = seen[0];
+
+    if (got < 2) return NAT_UNKNOWN;
+    return netaddr_equal(&seen[0], &seen[1]) ? NAT_CONE : NAT_SYMMETRIC;
 }

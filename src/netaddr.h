@@ -57,10 +57,6 @@ int netaddr_decode(netaddr_t *a, const uint8_t *in);
  * dual stack socket. No-op for addresses that are already v6. */
 void netaddr_to_v4mapped(netaddr_t *a);
 
-/* True for loopback, link-local, or the various private ranges, including
- * IPv4 100.64/10 (CGNAT) and IPv6 fc00::/7 (unique local). Candidates that
- * are not globally routable are worth reporting but rarely worth punching. */
-int netaddr_is_global(const netaddr_t *a);
 
 /* Open a dual stack UDP socket bound to *port (0 picks one). On return
  * *port holds the port actually bound. Falls back to IPv4 only if the

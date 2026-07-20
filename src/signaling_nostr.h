@@ -13,8 +13,8 @@
  *             nostr_content_key.
  *
  * No server of your own is needed, at the cost of two limitations:
- *   - It cannot relay data (supports_relay() returns 0). If hole punching
- *     fails, the connection fails.
+ *   - It carries signalling only, never data. If hole punching fails,
+ *     the connection fails.
  *   - Relays speak WebSocket over TCP and cannot observe your UDP
  *     mapping. The caller must gather candidates via STUN and pass them
  *     to publish().

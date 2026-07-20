@@ -21,10 +21,11 @@
  *      Relays are public; nothing goes out in clear text.
  *   3. Decrypt the peer's event to learn their candidates.
  *
- * Differences from the custom relay backend: that server sees our UDP
- * source address directly, whereas Nostr rides a separate TCP connection
- * and cannot, so STUN is required. And Nostr cannot carry data
- * (supports_relay() == 0): if punching fails, the connection fails.
+ * Two consequences of riding a general-purpose relay rather than a
+ * purpose-built rendezvous server. Nostr runs over a separate TCP
+ * connection, so it cannot observe our UDP source address the way a UDP
+ * rendezvous server could -- which is why STUN is mandatory here. And it
+ * cannot carry data: if punching fails, the connection fails.
  *
  * On synchronisation: a rendezvous server can trigger both sides at once.
  * Nostr has no such primitive, so each peer starts punching the moment it
@@ -36,11 +37,14 @@
 
 /* Published payload, encrypted then base64'd into `content`:
  *
- *   self_tag(8) || count(1) || candidate[count] * NETADDR_WIRE_LEN
+ *   self_tag(8) || round(1) || count(1) || candidate[count] * NETADDR_WIRE_LEN
  *
- * self_tag lets us ignore our own events, which relays echo back. */
+ * self_tag lets us ignore our own events, which relays echo back.
+ * round distinguishes one punch attempt's candidates from the next; see
+ * signaling.h. */
 #define TAG_LEN 8
-#define PAYLOAD_MAX (TAG_LEN + 1 + SIG_MAX_CANDIDATES * NETADDR_WIRE_LEN)
+#define HDR_LEN (TAG_LEN + 2)
+#define PAYLOAD_MAX (HDR_LEN + SIG_MAX_CANDIDATES * NETADDR_WIRE_LEN)
 
 typedef struct {
     ws_conn_t *ws[MAX_RELAYS];
@@ -69,6 +73,7 @@ static int ns_publish(void *ctx, const sig_candidates_t *mine) {
     size_t off = 0;
     memcpy(payload, c->self_tag, TAG_LEN);
     off += TAG_LEN;
+    payload[off++] = mine->round;
     payload[off++] = (uint8_t)mine->n;
     for (int i = 0; i < mine->n; i++) {
         netaddr_encode(&mine->addr[i], payload + off);
@@ -103,6 +108,9 @@ static int ns_publish(void *ctx, const sig_candidates_t *mine) {
 static int ns_wait_peer(void *ctx, sig_candidates_t *peer_out, int timeout_ms) {
     nostr_ctx_t *c = ctx;
 
+    /* Read before the memset below clears peer_out. */
+    const uint8_t want_round = peer_out->round;
+
     struct timespec start, now;
     clock_gettime(CLOCK_MONOTONIC, &start);
 
@@ -132,17 +140,30 @@ static int ns_wait_peer(void *ctx, sig_candidates_t *peer_out, int timeout_ms) {
 
             uint8_t payload[PAYLOAD_MAX];
             int plen = nostr_decrypt_payload(&c->id, content, payload, sizeof(payload));
-            if (plen < (int)(TAG_LEN + 1)) continue;   /* not for us */
+            if (plen < (int)HDR_LEN) continue;   /* not for us */
 
             /* Relays echo our own events back to us. */
             if (memcmp(payload, c->self_tag, TAG_LEN) == 0) continue;
 
-            int count = payload[TAG_LEN];
+            /* A leftover announcement from an earlier punch attempt names a
+             * mapping we have already given up on. Keep waiting rather than
+             * punching a stale address.
+             *
+             * A *later* round is the opposite: it is fresher than what we
+             * asked for, and it means the peer has already moved on. Take it
+             * and let the caller catch up -- see signaling.h. Refusing it is
+             * what used to strand the slower peer, because the faster one
+             * never repeats a round it has left. */
+            const uint8_t got_round = payload[TAG_LEN];
+            if (got_round < want_round) continue;
+
+            int count = payload[TAG_LEN + 1];
             if (count <= 0 || count > SIG_MAX_CANDIDATES) continue;
-            if (plen != (int)(TAG_LEN + 1 + (size_t)count * NETADDR_WIRE_LEN)) continue;
+            if (plen != (int)(HDR_LEN + (size_t)count * NETADDR_WIRE_LEN)) continue;
 
             memset(peer_out, 0, sizeof(*peer_out));
-            size_t off = TAG_LEN + 1;
+            peer_out->round = got_round;   /* what the peer is on, not what we asked for */
+            size_t off = HDR_LEN;
             for (int j = 0; j < count; j++) {
                 if (netaddr_decode(&peer_out->addr[peer_out->n], payload + off) == 0)
                     peer_out->n++;
@@ -156,27 +177,6 @@ static int ns_wait_peer(void *ctx, sig_candidates_t *peer_out, int timeout_ms) {
             return -1;
         }
     }
-}
-
-static int ns_supports_relay(void *ctx) {
-    (void)ctx;
-    /* Signalling only. Event size limits, rate limits, and basic courtesy
-     * toward public infrastructure all rule out using relays as a byte
-     * pipe. */
-    return 0;
-}
-
-static int ns_relay_send(void *ctx, const void *p, size_t len) {
-    (void)ctx; (void)p; (void)len;
-    return -1;
-}
-static int ns_relay_recv(void *ctx, void *p, size_t maxlen, int timeout_ms) {
-    (void)ctx; (void)p; (void)maxlen; (void)timeout_ms;
-    return -1;
-}
-static int ns_relay_keepalive(void *ctx) {
-    (void)ctx;
-    return -1;
 }
 
 static void ns_close(void *ctx) {
@@ -247,10 +247,6 @@ int signaling_nostr_create(signaling_backend_t *out,
     out->ctx = c;
     out->publish = ns_publish;
     out->wait_peer = ns_wait_peer;
-    out->supports_relay = ns_supports_relay;
-    out->relay_send = ns_relay_send;
-    out->relay_recv = ns_relay_recv;
-    out->relay_keepalive = ns_relay_keepalive;
     out->close = ns_close;
     return 0;
 }

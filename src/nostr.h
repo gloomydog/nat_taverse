@@ -40,8 +40,10 @@ typedef struct {
  * the pubkey itself.
  *
  * This proves knowledge of the passphrase and nothing more. It is not
- * peer authentication; anyone holding the passphrase can join. The
- * handshake in handshake.h is what actually authenticates.
+ * peer authentication; anyone holding the passphrase can join the
+ * rendezvous, and this library has no notion of identity beyond it. An
+ * application that needs to know *who* is on the far end must establish
+ * that itself, over the path once it is open.
  *
  * The encryption key is separate, so a signing key leak does not expose
  * previously published addresses.

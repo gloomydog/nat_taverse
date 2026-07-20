@@ -422,8 +422,6 @@ int ws_recv_text(ws_conn_t *c, char *buf, size_t maxlen, int timeout_ms) {
     }
 }
 
-int ws_fd(ws_conn_t *c) { return c ? c->fd : -1; }
-
 void ws_close(ws_conn_t *c) {
     if (!c) return;
     if (c->ssl) {

@@ -31,7 +31,5 @@ int ws_recv_text(ws_conn_t *c, char *buf, size_t maxlen, int timeout_ms);
 
 void ws_close(ws_conn_t *c);
 
-/* Underlying socket, in case the caller wants to select() on it. */
-int ws_fd(ws_conn_t *c);
 
 #endif
